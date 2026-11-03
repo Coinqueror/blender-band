@@ -1,0 +1,60 @@
+{
+  "name": "blender-band",
+  "version": "0.2.0",
+  "description": "A Blender side panel for Claude Code: running headless jobs with frame and sample progress and who started them, GPU/CPU temperature and load, RAM and disk, and a live preview of the newest render, frame sequence or video. Gives Claude a blender_status tool to check on or wait for a render.",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "outputsDir": {
+      "type": "string",
+      "title": "Outputs folders",
+      "description": "Where your renders and videos land, searched six levels deep for the newest picture, frame sequence or video. Several folders separated by ';'; '~' is your home folder. Empty: the session's folder (unless it is your home folder), plus every folder a running Blender saves into, remembered across sessions.",
+      "default": ""
+    },
+    "hotWarnC": {
+      "type": "number",
+      "title": "GPU warning temperature (C)",
+      "description": "The GPU reading turns yellow 6 C below this and red at it, with a toast.",
+      "default": 85
+    },
+    "lowRamPercent": {
+      "type": "number",
+      "title": "Low RAM warning (% of total)",
+      "description": "Available RAM below this share of the total turns yellow.",
+      "default": 10
+    },
+    "minDiskGB": {
+      "type": "number",
+      "title": "Low disk warning (GB)",
+      "description": "Free disk space below this turns red.",
+      "default": 10
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Refresh interval (seconds)",
+      "description": "How often the panel reads processes, logs and sensors.",
+      "default": 5
+    },
+    "openOnJob": {
+      "type": "boolean",
+      "title": "Open the panel when a job starts",
+      "description": "Opens the Blender panel when a new Blender process appears.",
+      "default": true
+    },
+    "openOnStart": {
+      "type": "boolean",
+      "title": "Open the panel when a session starts",
+      "description": "Opens the Blender panel in every new session, Blender running or not.",
+      "default": false
+    },
+    "wrapperScripts": {
+      "type": "string",
+      "title": "Your Blender wrapper scripts",
+      "description": "Names of scripts you run Blender through (resource limits, thermal guards, queues), separated by ';', e.g. render.sh;blender_job.sh. When set, a Bash call of Claude's that runs the blender binary headless itself is refused and pointed at them. Empty: no guard.",
+      "default": ""
+    }
+  },
+  "author": {
+    "name": "Coinqueror"
+  }
+}
