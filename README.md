@@ -4,9 +4,10 @@ A Claude Code mod for working with headless Blender: a **Blender side panel** be
 
 The panel shows:
 
-- **Jobs:** every running Blender, with its script and `.blend`, how long it has run, and who started it (this session, another Claude session, agy, Codex, Gemini, ...). Its log gives frame, sample (Cycles and EEVEE), time left and the last line. A Python traceback shows in red, and a job that has been stopped shows as paused. A persistent Blender that keeps a file loaded between jobs shows the file it holds and whether it is busy.
-- **System:** GPU temperature with a short trend, load and VRAM (AMD, NVIDIA, Intel), CPU temperature and load, free RAM and disk, and a note when ComfyUI is running too.
-- **Preview:** the newest render. A frame sequence plays as a looping flipbook, with ◀ ▶ to step through single frames. A video plays as a short looping preview, with **Play** to open it in your player.
+- **Jobs:** a card for every running Blender, with its script and `.blend`, how long it has run, and who started it (this session, another Claude session, agy, Codex, Gemini, ...). Its log gives frame and sample (Cycles and EEVEE). When the command line names the frames (`-s 1 -e 250 -a`), the card shows overall progress and time left. Each card has **Pause** / **Resume**, **Stop** (asks once more), and **Log**. A Python traceback shows in red with **Ask Claude**, which puts a question about the error in your prompt box without sending it.
+- **Preview:** the newest render, with its size and resolution. A frame sequence plays as a looping flipbook, with ◀ ▶ to step through single frames. A video plays as a short looping preview with its length, and **Play** opens it in your player.
+- **System:** GPU temperature with a chart of the last minutes and the warning level dashed, then meters for GPU load, VRAM, CPU, RAM and disk. A meter turns yellow, then red, as a limit nears, and says so in words too.
+- **Finished:** the last jobs that ended, done or failed, with how long they took, kept across sessions.
 
 It also toasts when a job finishes or fails, and when the GPU gets hot.
 
@@ -63,7 +64,7 @@ In `/plugin` (or the desktop app's plugin settings):
 - **For previews**, any one of: `vipsthumbnail` (libvips), ImageMagick, `ffmpeg`, or Python's Pillow. `ffmpeg` (with `ffprobe`) is needed for video previews. Without any of them, the panel shows the file name with an **Open** button.
 - **GPU sensors:** AMD through `amdgpu` in `/sys`, NVIDIA through `nvidia-smi`, Intel Arc through `i915`/`xe` (temperature only).
 
-In the desktop app the preview is drawn as a small embedded SVG, kept under the app's size limit by downscaling. In a terminal that shows pictures (kitty, Ghostty), a PNG render is shown directly.
+In the desktop app the preview is drawn as shapes: the app does not show embedded pictures in a mod's drawings, so each frame is shrunk (to 256 px wide for a still, about 160 px for a loop), reduced to a small palette and drawn as colored runs. It is a preview, not full quality; **Open** and **Play** show the real file. In a terminal that shows pictures (kitty, Ghostty), a PNG render is shown directly.
 
 Everything runs on your machine. The mod makes no network requests, and the thumbnails run at the lowest CPU priority without touching the GPU.
 

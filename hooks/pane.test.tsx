@@ -56,7 +56,7 @@ type Body = Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>
 function seed(on: Parameters<Body>[1]) {
   on('state.get', (_, e, next) =>
     e.key === 'snapshot' ? { value: { value: { shape: 'snapshot-2', value: SNAPSHOT }, version: 1 } }
-    : e.key === 'thumb' ? { value: { value: { shape: 'thumb-1', value: { key: '/work/renders/f:3', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2 1" width="2" height="1"></svg>', width: 2, height: 1, frames: 3 } }, version: 1 } }
+    : e.key === 'thumb' ? { value: { value: { shape: 'thumb-2', value: { key: '/work/renders/f:3', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2 1" width="2" height="1"></svg>', width: 2, height: 1, frames: 3 } }, version: 1 } }
     : next(e),
   )
 }
@@ -65,15 +65,34 @@ test('the pane draws a job, the sensors and the frame sequence on every surface'
   seed(on)
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /a_very_long_render_script/ }))?.text).toContain('final_stage.blend')
-    expect((await ui.find({ type: 'Text', text: /started by agy/ }))?.text).toBe('running · started by agy · 4m12s')
-    expect((await ui.find({ type: 'Text', text: /^frame 112/ }))?.text).toBe('frame 112 · sample 64/128 · 05:12 left')
+    expect((await ui.find({ type: 'Text', text: /a_very_long_render_script/ }))?.text).toBe(JOB.script)
+    expect((await ui.find({ type: 'Text', text: /started by agy/ }))?.text).toBe('final_stage.blend · running · started by agy · 4m12s')
+    expect((await ui.find({ type: 'Text', text: /^Frame 112/ }))?.text).toBe('Frame 112 · sample 64/128')
+    expect((await ui.find({ type: 'Text', text: /left in this frame/ }))?.text).toBe('05:12 left in this frame')
+    expect(await ui.find({ key: 'pause-4242' })).toBeDefined()
+    expect(await ui.find({ key: 'log-4242' })).toBeDefined()
     expect((await ui.find({ type: 'Text', text: /°C$/ }))?.text).toBe('81°C')
-    expect((await ui.find({ type: 'Text', text: /^Frames/ }))?.text).toBe('Frames · f · 3 so far')
+    expect((await ui.find({ type: 'Text', text: /^frames/ }))?.text).toBe('frames · f · 3 so far')
     expect(await ui.find({ key: 'prev' })).toBeDefined()
     expect(await ui.find({ key: 'folder' })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('Stop asks once more before it stops a job', async ($, on) => {
+  seed(on)
+  const signals: string[][] = []
+  on('process.run', (_, e) => {
+    signals.push([...e.argv])
+    return { value: { exitCode: 0, stdout: '{}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'stop-4242' })
+  expect(signals.some(argv => argv[0] === 'kill')).toBe(false)
+  expect(await ui.find({ key: 'stop-yes-4242' })).toBeDefined()
+  await ui.press({ key: 'stop-yes-4242' })
+  expect(signals.some(argv => argv.join(' ') === 'kill -TERM 4242')).toBe(true)
+  await ui.unmount()
 })
 
 test('before the first reading the pane says it is reading', async ($, on) => {

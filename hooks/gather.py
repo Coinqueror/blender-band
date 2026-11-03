@@ -2,28 +2,32 @@
 """blender-band's reader: prints one JSON object on stdout.
 
   gather.py status <outputs dir>...          jobs, sensors, the newest output
-  gather.py still <path> <width>             a picture's thumbnail as an SVG
-  gather.py flip <dir> <width> <name>...     a looping flipbook of frames
-  gather.py video <path> <width>             a looping preview of a video
+  gather.py still <path> <width>             a picture drawn as SVG shapes
+  gather.py flip <dir> <width> <name>...     a looping flipbook of frames, as shapes
+  gather.py video <path> <width>             a looping preview of a video, as shapes
   gather.py wait <seconds> <pid>...          returns once one of the pids exits
 
 Linux only: it reads /proc and /sys. Thumbnails run at the lowest CPU priority
 and never touch the GPU, so a preview cannot trip a thermal guard.
 """
-import base64
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 IMAGE = re.compile(r"\.(png|jpe?g|webp)$", re.I)
 VIDEO = re.compile(r"\.(mp4|mkv|webm|mov|avi)$", re.I)
 FRAME = re.compile(r"^(.*?)(\d{2,})(\.[A-Za-z0-9]+)$")
 AGENT = re.compile(r"^(claude|agy|antigravity|codex|gemini|aider|opencode|cursor-agent|goose)$", re.I)
+# Python warnings and the like say nothing about what Blender is doing.
+NOISE = re.compile(r"(Deprecation|User|Future|Runtime)Warning|^\s*warnings\.warn|^Read prefs|^Blender \d|^Blender quit")
+# Blender 4.2+ prefixes log lines with a clock and a channel: "00:06.285  render  | ".
+LOG_PREFIX = re.compile(r"^\d+:\d+\.\d+\s+[\w.]+\s+\|\s*")
+# A video's name holds its frame range: spin_0001-0072.mp4.
+RANGE_IN_NAME = re.compile(r"(\d{3,})-(\d{3,})\.\w+$")
 SKIP_DIRS = {"_to_delete", "__pycache__", "node_modules", ".git"}
 SVG_BUDGET = 120_000  # the desktop's Svg takes 131072 characters
 SCAN_BUDGET = 60_000  # directory entries one search of the outputs folders reads at most
@@ -123,6 +127,24 @@ def describe(argv):
     return kind, script, blend, sock
 
 
+def frame_range(argv):
+    """[first, last] frame from -s/-e (with -a) or a single -f, when the command line says."""
+    start = end = single = None
+    for i, a in enumerate(argv[:-1]):
+        value = argv[i + 1]
+        if a in ("-s", "--frame-start") and value.isdigit():
+            start = int(value)
+        elif a in ("-e", "--frame-end") and value.isdigit():
+            end = int(value)
+        elif a in ("-f", "--render-frame") and value.isdigit():
+            single = int(value)
+    if single is not None:
+        return [single, single]
+    if start is not None and end is not None and end >= start and ("-a" in argv or "--render-anim" in argv):
+        return [start, end]
+    return None
+
+
 def progress_of(text):
     """Frame, samples, time left, saved files, an error and the last line of a log."""
     out = {}
@@ -138,7 +160,7 @@ def progress_of(text):
             if r:
                 out["remaining"] = r.group(1).split(".")[0]
             break
-        m = re.search(r"Append frame (\d+)", line)
+        m = re.search(r"append frame (\d+)", line, re.I)
         if m:
             out["frame"] = int(m.group(1))
             break
@@ -150,8 +172,8 @@ def progress_of(text):
     if any(l.startswith("Traceback (most recent call last)") for l in recent):
         message = next((l for l in reversed(recent) if re.match(r"^[\w.]+(Error|Exception)\b", l)), "Python error")
         out["error"] = message[:300]
-    last = next((l.strip() for l in reversed(lines) if l.strip() and not l.startswith(" ")), "")
-    out["last"] = last[:300]
+    last = next((l.strip() for l in reversed(lines) if l.strip() and not l.startswith(" ") and not NOISE.search(l)), "")
+    out["last"] = LOG_PREFIX.sub("", last)[:300]
     return out
 
 
@@ -208,9 +230,16 @@ def jobs(session_pid):
             "server": sock,
             "driver": None,
             "progress": progress_of(text) if text else {},
+            "frames": frame_range(argv),
             "thermal": thermal_of(log, kind),
         }
         job["writing"] = open_outputs(pid)
+        if job["frames"] is None:
+            for path in job["writing"]:
+                m = RANGE_IN_NAME.search(path)
+                if m and int(m.group(2)) >= int(m.group(1)):
+                    job["frames"] = [int(m.group(1)), int(m.group(2))]
+                    break
         if kind == "server":
             held = server_file(text, pid)
             job["blend"] = os.path.basename(held) if held else job["blend"]
@@ -324,9 +353,10 @@ def sensors(outputs):
     out["ramTotalMB"] = int(mem.get("MemTotal", 0)) // 1024 or None
     target = next((d for d in outputs if os.path.isdir(d)), os.path.expanduser("~"))
     try:
-        out["diskGB"] = shutil.disk_usage(target).free // 1024 ** 3
+        usage = shutil.disk_usage(target)
+        out["diskGB"], out["diskTotalGB"] = usage.free // 1024 ** 3, usage.total // 1024 ** 3
     except OSError:
-        out["diskGB"] = None
+        out["diskGB"] = out["diskTotalGB"] = None
     return out
 
 
@@ -370,6 +400,9 @@ def newest_output(outputs, extra):
     mtime, path = best
     d, name = os.path.split(path)
     item = {"path": path, "dir": d, "name": name, "mtimeMs": int(mtime * 1000), "size": os.path.getsize(path)}
+    dims = picture_size(path)
+    if dims:
+        item["width"], item["height"] = dims
     if VIDEO.search(name):
         item["kind"] = "video"
         return item
@@ -398,6 +431,11 @@ def status(outputs, session_pid):
 
 
 # ---------------------------------------------------------------- thumbnails
+#
+# The desktop app's Svg drops <image> (it allows shapes, animation and filters
+# only), so a picture is drawn as shapes: shrunk, reduced to a small palette,
+# and each row written as colored line runs. A loop draws its first frame
+# whole and, on top, only what each later frame changes.
 
 
 def lower_priority():
@@ -405,6 +443,20 @@ def lower_priority():
         os.nice(19)
     except OSError:
         pass
+
+
+def picture_size(path):
+    """(width, height) of a PNG or JPEG from its header, without decoding it."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return None
+    if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
+        return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+    if head[:2] == b"\xff\xd8":
+        return jpeg_size(head)
+    return None
 
 
 def jpeg_size(data):
@@ -422,112 +474,225 @@ def jpeg_size(data):
     return None
 
 
-def thumb(path, width, quality, tmp):
-    """One small JPEG of a picture, or None."""
-    out = os.path.join(tmp, f"t{abs(hash((path, width, quality)))}.jpg")
-    # Whichever is installed, fastest first; Pillow last, in this process.
-    tools = [
-        ("vipsthumbnail", ["vipsthumbnail", path, "--size", f"{width}x", "-o", f"{out}[Q={quality},strip]"]),
-        ("magick", ["magick", path, "-thumbnail", f"{width}x", "-strip", "-quality", str(quality), out]),
-        ("convert", ["convert", path, "-thumbnail", f"{width}x", "-strip", "-quality", str(quality), out]),
-        ("ffmpeg", ["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", f"scale={width}:-2", "-q:v", str(max(2, min(31, (100 - quality) // 3))), out]),
-    ]
-    for name, cmd in tools:
-        if not shutil.which(name):
+def parse_ppm(data):
+    """(w, h, rgb bytes) of a binary PPM (P6, 8 bits)."""
+    fields, i = [], 2
+    while len(fields) < 3:
+        while data[i : i + 1].isspace():
+            i += 1
+        if data[i : i + 1] == b"#":
+            i = data.index(b"\n", i) + 1
             continue
-        try:
-            done = subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            done = False
-        if done and os.path.exists(out):
-            with open(out, "rb") as f:
-                return f.read()
-    try:
-        from PIL import Image  # noqa: PLC0415 - optional
-        import io  # noqa: PLC0415
+        j = i
+        while not data[j : j + 1].isspace():
+            j += 1
+        fields.append(int(data[i:j]))
+        i = j
+    w, h, _ = fields
+    start = i + 1
+    return w, h, data[start : start + w * h * 3]
 
-        with Image.open(path) as im:
-            im = im.convert("RGB")
-            im.thumbnail((width, width * 4))
-            buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=quality)
-            return buf.getvalue()
-    except Exception:  # noqa: BLE001 - Pillow missing or the file unreadable
+
+def pixels(path, width, at=None):
+    """(w, h, [(r, g, b), ...]) of a picture or a video frame at `at` seconds, `width` wide; None when unreadable."""
+    found = None
+    if shutil.which("ffmpeg"):
+        cmd = ["ffmpeg", "-v", "error"] + (["-ss", f"{at:.3f}"] if at is not None else [])
+        cmd += ["-i", path, "-frames:v", "1", "-vf", f"scale={width}:-2:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        try:
+            data = subprocess.run(cmd, capture_output=True, timeout=60).stdout
+            if data:
+                h = len(data) // (width * 3)
+                found = (width, h, data[: width * h * 3])
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if found is None and at is None and (shutil.which("magick") or shutil.which("convert")):
+        tool = "magick" if shutil.which("magick") else "convert"
+        try:
+            data = subprocess.run([tool, path + "[0]", "-resize", f"{width}x", "-depth", "8", "ppm:-"], capture_output=True, timeout=60).stdout
+            if data.startswith(b"P6"):
+                found = parse_ppm(data)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    if found is None and at is None:
+        try:
+            from PIL import Image  # noqa: PLC0415 - optional
+
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im = im.resize((width, max(1, round(im.height * width / im.width))))
+                found = (im.width, im.height, im.tobytes())
+        except Exception:  # noqa: BLE001 - Pillow missing or the file unreadable
+            pass
+    if found is None:
+        return None
+    w, h, data = found
+    return w, h, [tuple(data[i : i + 3]) for i in range(0, len(data), 3)]
+
+
+def near(p, colors):
+    return min(range(len(colors)), key=lambda j: (p[0] - colors[j][0]) ** 2 + (p[1] - colors[j][1]) ** 2 + (p[2] - colors[j][2]) ** 2)
+
+
+def palette_of(pixels_, k, rounds=8):
+    """k colors for the pixels: k-means from colors spread by brightness."""
+    sample = pixels_[:: max(1, len(pixels_) // 5000)]
+    ordered = sorted(set(sample), key=lambda c: c[0] * 3 + c[1] * 6 + c[2])
+    if len(ordered) <= k:
+        return ordered
+    centers = [ordered[int(i * (len(ordered) - 1) / (k - 1))] for i in range(k)]
+    for _ in range(rounds):
+        sums = [[0, 0, 0, 0] for _ in centers]
+        for p in sample:
+            s = sums[near(p, centers)]
+            s[0] += p[0]
+            s[1] += p[1]
+            s[2] += p[2]
+            s[3] += 1
+        centers = [(s[0] // s[3], s[1] // s[3], s[2] // s[3]) if s[3] else c for s, c in zip(sums, centers)]
+    return centers
+
+
+def indexed(pixels_, colors):
+    cache = {}
+    out = []
+    for p in pixels_:
+        i = cache.get(p)
+        if i is None:
+            i = cache[p] = near(p, colors)
+        out.append(i)
+    return out
+
+
+def runs(indexes, w, h, mask=None):
+    """Per palette index, the path data of its horizontal runs (only where mask is set, if given)."""
+    paths = {}
+    for y in range(h):
+        row = y * w
+        x = 0
+        while x < w:
+            if mask is not None and not mask[row + x]:
+                x += 1
+                continue
+            i = indexes[row + x]
+            start = x
+            while x < w and indexes[row + x] == i and (mask is None or mask[row + x]):
+                x += 1
+            paths.setdefault(i, []).append(f"M{start} {y}h{x - start}")
+    return paths
+
+
+def drawn(paths, colors):
+    return "".join(
+        f'<path stroke="#{colors[i][0]:02x}{colors[i][1]:02x}{colors[i][2]:02x}" d="{"".join(d)}"/>' for i, d in paths.items()
+    )
+
+
+def svg_of(frames, w, h, colors, seconds_per_frame):
+    n = len(frames)
+    base = frames[0]
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}" shape-rendering="crispEdges">',
+        f'<g fill="none" stroke-width="1" transform="translate(0 0.5)">{drawn(runs(base, w, h), colors)}',
+    ]
+    times = ";".join(f"{j / n:.4f}" for j in range(n))
+    for k in range(1, n):
+        mask = [a != b for a, b in zip(frames[k], base)]
+        values = ";".join("visible" if j == k else "hidden" for j in range(n))
+        parts.append(
+            f'<g visibility="hidden"><animate attributeName="visibility" values="{values}" keyTimes="{times}" '
+            f'calcMode="discrete" dur="{n * seconds_per_frame:.2f}s" repeatCount="indefinite"/>'
+            f"{drawn(runs(frames[k], w, h, mask), colors)}</g>"
+        )
+    parts.append("</g></svg>")
+    return "".join(parts)
+
+
+def shrink(grab, width):
+    """A grabbed picture scaled down to width, each new pixel the average of the ones it covers."""
+    w, h, px = grab
+    if width >= w:
+        return grab
+    height = max(1, round(h * width / w))
+    out = []
+    for y in range(height):
+        y0, y1 = y * h // height, max(y * h // height + 1, (y + 1) * h // height)
+        for x in range(width):
+            x0, x1 = x * w // width, max(x * w // width + 1, (x + 1) * w // width)
+            r = g = b = n = 0
+            for yy in range(y0, y1):
+                row = yy * w
+                for xx in range(x0, x1):
+                    q = px[row + xx]
+                    r += q[0]
+                    g += q[1]
+                    b += q[2]
+                    n += 1
+            out.append((r // n, g // n, b // n))
+    return width, height, out
+
+
+def shapes(grab, tries, seconds_per_frame):
+    """The first of (width, frame count, colors) tries whose drawing fits the budget.
+
+    Pictures are read once, at the first try's size and count; later tries shrink and thin those."""
+    first = [g for g in grab(tries[0][0], tries[0][1]) if g is not None]
+    if not first:
+        return {"error": "the picture could not be read (install ffmpeg, ImageMagick or Pillow)"}
+    first = [g for g in first if (g[0], g[1]) == (first[0][0], first[0][1])]
+    for width, count, k in tries:
+        grabs = [shrink(g, width) for g in spread(first, count)]
+        w, h = grabs[0][0], grabs[0][1]
+        colors = palette_of([p for g in grabs for p in g[2]], k)
+        text = svg_of([indexed(g[2], colors) for g in grabs], w, h, colors, seconds_per_frame)
+        if len(text) <= SVG_BUDGET:
+            return {"svg": text, "width": w, "height": h, "frames": len(grabs)}
+    return {"error": "the picture is too detailed to draw here"}
+
+
+def spread(items, count):
+    if len(items) <= count:
+        return list(items)
+    return [items[round((len(items) - 1) * i / (count - 1))] for i in range(count)]
+
+
+def still(path):
+    return shapes(lambda w, _: [pixels(path, w)], [(256, 1, 48), (224, 1, 40), (192, 1, 40), (160, 1, 32), (128, 1, 32)], 1)
+
+
+def flip(paths):
+    tries = [(160, 12, 32), (128, 12, 32), (128, 8, 28), (112, 6, 24), (96, 4, 24)]
+    return shapes(lambda w, n: [pixels(p, w) for p in spread(paths, n)], tries, 0.2)
+
+
+def probe(path):
+    """(seconds, width, height) of a video, or None when it cannot be read yet."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+        data = json.loads(out)
+        duration = float(data["format"]["duration"])
+        stream = (data.get("streams") or [{}])[0]
+        return duration, stream.get("width"), stream.get("height")
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         return None
 
 
-def svg(frames, seconds_per_frame):
-    """An SVG of JPEG frames: one picture, or a loop that shows the last when it cannot play."""
-    size = jpeg_size(frames[-1]) or (320, 180)
-    w, h = size
-    n = len(frames)
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">']
-    for i, data in enumerate(frames):
-        href = "data:image/jpeg;base64," + base64.b64encode(data).decode()
-        if n == 1:
-            parts.append(f'<image href="{href}" width="{w}" height="{h}"/>')
-            continue
-        values = ";".join("1" if k == i else "0" for k in range(n))
-        times = ";".join(f"{k / n:.4f}" for k in range(n))
-        parts.append(
-            f'<image href="{href}" width="{w}" height="{h}" opacity="{1 if i == n - 1 else 0}">'
-            f'<animate attributeName="opacity" values="{values}" keyTimes="{times}" calcMode="discrete" '
-            f'dur="{n * seconds_per_frame:.2f}s" repeatCount="indefinite"/></image>'
-        )
-    parts.append("</svg>")
-    return "".join(parts), w, h
-
-
-def fit(make, paths, width, seconds_per_frame):
-    """Thumbnails of paths as one SVG under the budget: smaller, then fewer, until it fits."""
-    with tempfile.TemporaryDirectory(prefix="blender-band-") as tmp:
-        for w, q in ((width, 62), (int(width * 0.8), 55), (int(width * 0.65), 50)):
-            frames = [d for d in (make(p, w, q, tmp) for p in paths) if d]
-            while frames:
-                text, fw, fh = svg(frames, seconds_per_frame)
-                if len(text) <= SVG_BUDGET:
-                    return {"svg": text, "width": fw, "height": fh, "frames": len(frames)}
-                if len(frames) <= 4:
-                    break
-                frames = frames[1::2] if len(frames) > 8 else frames[1:]
-        return {"error": "the picture would not fit"}
-
-
-def video_frames(path, n):
-    """n evenly spaced timestamps of a video, or [] when it cannot be read yet."""
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=20,
-        ).stdout.strip()
-        duration = float(out)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return []
-    if duration <= 0:
-        return []
-    return [duration * (i + 0.5) / n for i in range(n)]
-
-
-def video_thumb(path, at):
-    def make(_, w, q, tmp):
-        out = os.path.join(tmp, f"v{w}_{at:.3f}.jpg")
-        cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{at:.3f}", "-i", path, "-frames:v", "1",
-               "-vf", f"scale={w}:-2", "-q:v", str(max(2, min(31, (100 - q) // 3))), out]
-        if subprocess.run(cmd, capture_output=True, timeout=60).returncode != 0 or not os.path.exists(out):
-            return None
-        with open(out, "rb") as f:
-            return f.read()
-    return make
-
-
-def video(path, width):
+def video(path):
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         return {"error": "install ffmpeg for video previews"}
-    stamps = video_frames(path, 12)
-    if not stamps:
-        return {"error": "the video cannot be read yet"}
-    makers = {f"{t:.3f}": video_thumb(path, t) for t in stamps}
-    return fit(lambda key, w, q, tmp: makers[key](key, w, q, tmp), list(makers), width, 0.25)
+    probed = probe(path)
+    if probed is None or probed[0] <= 0:
+        return {"error": "Still being written: the preview plays once Blender finishes the video."}
+    duration, w, h = probed
+    tries = [(160, 12, 32), (128, 12, 32), (128, 8, 28), (112, 6, 24), (96, 4, 24)]
+    made = shapes(lambda width, n: [pixels(path, width, duration * (i + 0.5) / n) for i in range(n)], tries, 0.25)
+    minutes, seconds = divmod(int(round(duration)), 60)
+    made["info"] = f"{minutes}:{seconds:02d}" + (f" · {w}×{h}" if w and h else "")
+    return made
 
 
 def wait(seconds, pids):
@@ -548,14 +713,13 @@ def main(argv):
         result = status(outputs, os.getppid())
     elif command == "still":
         lower_priority()
-        result = fit(lambda p, w, q, tmp: thumb(p, w, q, tmp), [argv[2]], int(argv[3]), 1)
+        result = still(argv[2])
     elif command == "flip":
         lower_priority()
-        d, width, names = argv[2], int(argv[3]), argv[4:]
-        result = fit(lambda p, w, q, tmp: thumb(p, w, q, tmp), [os.path.join(d, n) for n in names], width, 0.2)
+        result = flip([os.path.join(argv[2], n) for n in argv[4:]])
     elif command == "video":
         lower_priority()
-        result = video(argv[2], int(argv[3]))
+        result = video(argv[2])
     elif command == "log":
         result = progress_of(tail(argv[2]))
     elif command == "wait":

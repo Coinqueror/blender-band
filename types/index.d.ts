@@ -29,6 +29,8 @@ export type BlenderJob = {
   thermal: string | null
   /** Pictures and videos the process holds open: what it is writing now. */
   writing?: string[]
+  /** [first, last] frame when the command line names them (-s/-e with -a, or -f). */
+  frames?: [number, number] | null
   /** What this session's Bash call said it was doing, when this session started it. */
   intent?: string
 }
@@ -40,6 +42,7 @@ export type Sensors = {
   ramMB: number | null
   ramTotalMB: number | null
   diskGB: number | null
+  diskTotalGB?: number | null
 }
 
 /** The newest picture, frame sequence or video under the outputs folders. */
@@ -54,6 +57,22 @@ export type Output = {
   frames?: string[]
   count?: number
   stem?: string
+  /** Pixels, from a PNG's or JPEG's header. */
+  width?: number
+  height?: number
+}
+
+/** A job that ended, newest first in the history. */
+export type Finished = {
+  pid: number
+  name: string
+  blend: string | null
+  isFailed: boolean
+  error?: string
+  seconds: number
+  endedAt: number
+  log: string | null
+  driver: string | null
 }
 
 export type Snapshot = {
@@ -68,7 +87,7 @@ export type Snapshot = {
 }
 
 /** A preview drawn as an SVG, for the output or frame it was made from. */
-export type Thumb = { key: string; svg: string; width: number; height: number; frames: number } | { key: string; error: string }
+export type Thumb = { key: string; svg: string; width: number; height: number; frames: number; info?: string } | { key: string; error: string }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -78,6 +97,9 @@ declare module 'claude-code' {
       /** The frame (file path) of a sequence the person stepped to; null follows the newest. */
       step: string | null
       stepThumb: Shaped<Thumb | null>
+      history: Shaped<Finished[]>
+      /** The pid whose Stop button asks to be pressed again. */
+      confirmStop: number | null
     }
   }
 }

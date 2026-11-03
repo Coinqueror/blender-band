@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { BlenderJob, JobProgress, Output, Sensors, Snapshot, Thumb } from '../types'
+import type { BlenderJob, Finished, JobProgress, Output, Sensors, Snapshot, Thumb } from '../types'
 
 const PANE = 'blender'
 const TOOL = 'blender_status'
@@ -9,9 +9,11 @@ const TOOL = 'blender_status'
 // Change a tag when its value's fields change: a reload then starts from null
 // instead of reading what an older version stored.
 const snapshot = atom({ plugin: 'blender-band', key: 'snapshot' } as const, null, { shape: 'snapshot-2' })
-const thumb = atom({ plugin: 'blender-band', key: 'thumb' } as const, null, { shape: 'thumb-1' })
+const thumb = atom({ plugin: 'blender-band', key: 'thumb' } as const, null, { shape: 'thumb-2' })
 const step = atom({ plugin: 'blender-band', key: 'step' } as const, null)
-const stepThumb = atom({ plugin: 'blender-band', key: 'stepThumb' } as const, null, { shape: 'thumb-1' })
+const stepThumb = atom({ plugin: 'blender-band', key: 'stepThumb' } as const, null, { shape: 'thumb-2' })
+const history = atom({ plugin: 'blender-band', key: 'history' } as const, [], { shape: 'history-1' })
+const confirmStop = atom({ plugin: 'blender-band', key: 'confirmStop' } as const, null)
 
 type Options = {
   outputs: string[]
@@ -30,7 +32,9 @@ type Made = { svg: string; width: number; height: number; frames: number } | { e
 // Running the blender binary headless itself. `blender --version` and the like pass.
 const RAW_BLENDER = /(^|[;&|(`]|\bthen|\bdo|\bexec|\bnohup|\bnice|\btimeout\s+\S+)\s*("?[^\s;&|"]*\/)?blender"?\s+[^;&|]*(-b\b|--background\b|--python\b|-P\s|\.blend\b)/
 const STORE_DIRS = 'outputDirs'
+const STORE_HISTORY = 'history'
 const REMEMBERED_DIRS = 8
+const HISTORY = 8
 
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 /** Whether a command runs one of the person's wrapper scripts. */
@@ -69,6 +73,67 @@ function sparkline(values: number[], low: number, high: number): string {
 function bar(fraction: number, cells: number): string {
   const full = Math.max(0, Math.min(cells, Math.round(fraction * cells)))
   return '█'.repeat(full) + '░'.repeat(cells - full)
+}
+
+// Chart marks: the drawings carry no text (a picture cannot follow the app's
+// light or dark theme), so these mid-tone fills read on either surface and
+// every word beside them is a theme-colored Text.
+type Severity = 'ok' | 'warning' | 'critical'
+const FILL: Record<Severity, string> = { ok: '#3987e5', warning: '#fab219', critical: '#d03b3b' }
+const COLOR: Record<Severity, 'warning' | 'error' | undefined> = { ok: undefined, warning: 'warning', critical: 'error' }
+const clamp = (value: number) => Math.max(0, Math.min(1, value))
+
+/** A thin meter: the fill carries severity, the track is the same hue, faint. */
+function meterSvg(fraction: number, severity: Severity, width: number): string {
+  const h = 6
+  const w = clamp(fraction) * width
+  const fill = FILL[severity]
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${h}" width="${width}" height="${h}">` +
+    `<rect width="${width}" height="${h}" rx="3" fill="${fill}" fill-opacity="0.22"/>` +
+    (w > 0 ? `<rect width="${Math.max(h, w).toFixed(1)}" height="${h}" rx="3" fill="${fill}"/>` : '') +
+    '</svg>'
+  )
+}
+
+/** The GPU temperature over the last readings: a line with a faint area, the warning level dashed. */
+function tempSvg(values: readonly number[], warnC: number, width: number, height: number, stepSeconds: number): string {
+  // The scale hugs the readings (so a rise shows) while keeping the warning level in view.
+  const lo = Math.min(Math.min(...values) - 8, warnC - 25)
+  const hi = Math.max(warnC + 4, ...values)
+  const right = width - 5 // room for the newest reading's dot
+  const x = (i: number) => (values.length === 1 ? right : (i / (values.length - 1)) * right)
+  const y = (v: number) => height - 2 - ((v - lo) / (hi - lo)) * (height - 4)
+  const points = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`)
+  const last = values[values.length - 1] ?? lo
+  const severity: Severity = last >= warnC ? 'critical' : last >= warnC - 6 ? 'warning' : 'ok'
+  const slot = width / Math.max(1, values.length)
+  const hits = values
+    .map((v, i) => {
+      const age = Math.round((values.length - 1 - i) * stepSeconds)
+      return `<rect x="${(x(i) - slot / 2).toFixed(1)}" y="0" width="${slot.toFixed(1)}" height="${height}" fill="transparent"><title>${v}°C, ${age === 0 ? 'now' : `${since(age)} ago`}</title></rect>`
+    })
+    .join('')
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">` +
+    `<line x1="0" x2="${width}" y1="${y(warnC).toFixed(1)}" y2="${y(warnC).toFixed(1)}" stroke="${FILL.critical}" stroke-width="1" stroke-dasharray="4 3" opacity="0.8"/>` +
+    (points.length > 1
+      ? `<path d="M0,${height} L${points.join(' L')} L${width},${height} Z" fill="${FILL.ok}" fill-opacity="0.14"/>` +
+        `<polyline points="${points.join(' ')}" fill="none" stroke="${FILL.ok}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`
+      : '') +
+    `<circle cx="${x(values.length - 1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="4" fill="${FILL[severity]}"/>` +
+    hits +
+    '</svg>'
+  )
+}
+
+/** How far a job is through its frames (with the current frame's samples), when its range is known. */
+function overall(job: BlenderJob): number | null {
+  const range = job.frames
+  const frame = job.progress.frame
+  if (!range || frame === undefined) return null
+  const within = job.progress.sample !== undefined && job.progress.samples ? job.progress.sample / job.progress.samples : 0
+  return clamp((frame - range[0] + within) / (range[1] - range[0] + 1))
 }
 
 /** Up to `count` names spread evenly over a list, its last always among them. */
@@ -155,7 +220,7 @@ async function openPane($: EngineInterface): Promise<void> {
   }
 }
 
-async function finished($: EngineInterface, job: BlenderJob): Promise<void> {
+async function finished($: EngineInterface, job: BlenderJob, at: number): Promise<void> {
   if (job.kind !== 'run') return
   // The log's last lines come after the final reading: read them once more.
   const last = job.log === null ? job.progress : await gather<JobProgress>($, ['log', job.log], 10000).catch(() => job.progress)
@@ -165,6 +230,31 @@ async function finished($: EngineInterface, job: BlenderJob): Promise<void> {
       ? `Blender failed: ${name} after ${since(job.seconds)}: ${last.error}`
       : `Blender finished: ${name} after ${since(job.seconds)}`,
   )
+  const entry: Finished = {
+    pid: job.pid,
+    name,
+    blend: job.blend,
+    isFailed: last.error !== undefined,
+    ...(last.error === undefined ? {} : { error: last.error }),
+    seconds: job.seconds,
+    endedAt: at,
+    log: job.log,
+    driver: job.driver,
+  }
+  const list = await update($, history, old => [entry, ...old.filter(one => one.pid !== job.pid)].slice(0, HISTORY))
+  await $.store.set(STORE_HISTORY, list).catch(() => undefined)
+}
+
+async function signal($: EngineInterface, pid: number, name: 'STOP' | 'CONT' | 'TERM'): Promise<void> {
+  await $.process.run(['kill', `-${name}`, String(pid)])
+  await poll($)
+}
+
+/** Puts a question about a failed job in the prompt box, unsent. */
+async function askClaude($: EngineInterface, name: string, error: string, log: string | null): Promise<void> {
+  await $.prompt.fill({
+    text: `The Blender job ${name} failed with: ${error}${log ? `\nIts log is ${log}` : ''}\nWhat went wrong, and how do I fix it?`,
+  })
 }
 
 /** One reading at a time: a call while one runs waits for that one. */
@@ -200,7 +290,7 @@ async function readOnce($: EngineInterface): Promise<void> {
       for (const [pid, job] of previous) {
         if (!now.has(pid)) {
           intents.delete(pid)
-          void finished($, job)
+          void finished($, job, at)
         }
       }
     }
@@ -246,9 +336,9 @@ async function preview($: EngineInterface, output: Output, at: number): Promise<
   const key = outputKey(output)
   const current = await read($, thumb)
   if (isThumbing || current?.key === key) return
-  // A sequence still rendering gets a new flipbook at most every 20 seconds.
+  // A sequence still rendering gets a new flipbook at most once a minute: drawing one takes seconds of CPU.
   const isSameSequence = output.kind === 'sequence' && current?.key.startsWith(`${output.dir}/${output.stem}:`) === true
-  if (isSameSequence && at - lastFlipAt < 20000) return
+  if (isSameSequence && at - lastFlipAt < 60000) return
   isThumbing = true
   try {
     const args =
@@ -294,7 +384,12 @@ function statusText(snap: Snapshot): string {
     const who = driverText(job.driver)
     lines.push(`- pid ${job.pid}: ${title(job)}: ${state.word}, ${since(job.seconds)}${who ? `, ${who}` : ''}`)
     const progress = progressText(job.progress)
+    const done = overall(job)
     if (progress) lines.push(`  progress: ${progress}`)
+    if (done !== null && job.frames) {
+      const eta = done > 0.02 ? `, about ${since((job.seconds * (1 - done)) / done)} left` : ''
+      lines.push(`  overall: ${Math.round(done * 100)}% of frames ${job.frames[0]}-${job.frames[1]}${eta}`)
+    }
     if (job.progress.error) lines.push(`  error in log: ${job.progress.error}`)
     if (job.isPaused) lines.push(`  stopped (SIGSTOP)${job.thermal ? `; thermal guard log: ${job.thermal}` : ''}`)
     if (job.progress.last && !job.progress.error) lines.push(`  last log line: ${job.progress.last}`)
@@ -357,6 +452,11 @@ export const register: Register = (on, raw) => {
     searchDirs = options.outputs.length > 0 ? options.outputs : [await $.session.cwd()]
     const stored = await $.store.get(STORE_DIRS).catch(() => undefined)
     rememberedDirs = Array.isArray(stored) ? stored.filter((dir): dir is string => typeof dir === 'string').slice(0, REMEMBERED_DIRS) : []
+    const past = await $.store.get(STORE_HISTORY).catch(() => undefined)
+    if (Array.isArray(past) && (await read($, history)).length === 0) {
+      const kept = past.filter((one): one is Finished => typeof one === 'object' && one !== null && typeof (one as Finished).name === 'string' && typeof (one as Finished).endedAt === 'number')
+      await update($, history, () => kept.slice(0, HISTORY))
+    }
     void poll($)
     $.clock.every(options.pollSeconds * 1000, () => {
       void poll($)
@@ -411,131 +511,242 @@ export const register: Register = (on, raw) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Button, Text } = elements
+    const Svg = 'Svg' in elements ? elements.Svg : undefined
     const snap = await read($, snapshot)
     if (snap === null) return <Text dimColor>Reading Blender jobs and sensors…</Text>
     const columns = Math.max(20, e.props.bodyColumns)
+    // Pixels across the body where the surface draws pictures; cells are its code font's advance.
+    const px = Math.min(520, Math.floor(columns * 7.5))
+    const pending = await read($, confirmStop)
 
-    const label = (text: string) => (
-      <Box width={5} flexShrink={0}>
-        <Text dimColor>{text}</Text>
+    const heading = (text: string, aside?: string) => (
+      <Box flexDirection="row" columnGap={1}>
+        <Text size="caption" weight="semibold" dimColor>
+          {text.toUpperCase()}
+        </Text>
+        {aside ? (
+          <Text size="caption" dimColor wrap="truncate-end">
+            {aside}
+          </Text>
+        ) : null}
       </Box>
     )
-    const heading = (text: string) => (
-      <Text bold dimColor>
-        {text}
-      </Text>
+    const meter = (key: string, fraction: number, severity: Severity) =>
+      Svg ? (
+        <Svg key={key} source={meterSvg(fraction, severity, px)} alt={`${Math.round(fraction * 100)}%`} width={px} height={6} />
+      ) : (
+        <Text color={COLOR[severity]} dimColor={severity === 'ok'}>
+          {bar(fraction, Math.min(32, columns))}
+        </Text>
+      )
+    const row = (label: string, value: string, severity: Severity, note?: string) => (
+      <Box flexDirection="row" columnGap={1}>
+        <Box width={9} flexShrink={0}>
+          <Text size="footnote" dimColor>
+            {label}
+          </Text>
+        </Box>
+        <Text size="footnote" weight="medium" tabular color={COLOR[severity]}>
+          {value}
+        </Text>
+        {note ? (
+          <Text size="footnote" dimColor wrap="truncate-end">
+            {note}
+          </Text>
+        ) : null}
+      </Box>
     )
 
-    // Jobs
+    // Jobs: one card each.
+    const jobCards = snap.jobs.map(job => {
+      const state = stateOf(job)
+      const p = job.progress
+      const who = driverText(job.driver)
+      const done = overall(job)
+      const eta = done !== null && done > 0.02 ? since((job.seconds * (1 - done)) / done) : p.remaining
+      const severity: Severity = state.color === 'error' ? 'critical' : state.color === 'warning' ? 'warning' : 'ok'
+      const frameText =
+        p.frame === undefined ? null
+        : job.frames ? `Frame ${p.frame} of ${job.frames[1] - job.frames[0] + 1}`
+        : `Frame ${p.frame}`
+      const sampleText = p.sample !== undefined && p.samples !== undefined ? `sample ${p.sample}/${p.samples}` : null
+      const fraction = done ?? (p.sample !== undefined && p.samples ? p.sample / p.samples : null)
+      const isRun = job.kind !== 'window'
+      const isConfirming = pending === job.pid
+      return (
+        <Box
+          key={`job-${job.pid}`}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={state.color ?? 'subtle'}
+          paddingX={1}
+          rowGap={0}
+        >
+          <Box flexDirection="row" columnGap={1}>
+            <Text color={state.color} dimColor={state.color === undefined}>
+              {state.color === undefined ? '○' : '●'}
+            </Text>
+            <Text weight="semibold" wrap="truncate-end">
+              {job.kind === 'server' && !(job.isBusy && job.script) ? `Server · ${job.blend ?? 'no file'}` : (job.script ?? title(job))}
+            </Text>
+          </Box>
+          <Text size="footnote" dimColor wrap="truncate-end">
+            {[job.kind === 'server' ? null : job.blend, state.word, who, since(job.seconds)].filter(Boolean).join(' · ')}
+          </Text>
+          {job.intent ? (
+            <Text size="footnote" italic dimColor wrap="truncate-end">
+              “{job.intent}”
+            </Text>
+          ) : null}
+          {frameText || sampleText ? (
+            <Box flexDirection="row" columnGap={1} marginTop={1}>
+              <Text size="footnote" weight="medium" tabular wrap="truncate-end">
+                {[frameText, sampleText].filter(Boolean).join(' · ')}
+              </Text>
+            </Box>
+          ) : null}
+          {fraction !== null ? (
+            <Box flexDirection="column">
+              {meter(`progress-${job.pid}`, fraction, severity)}
+              <Box flexDirection="row" columnGap={1}>
+                <Text size="footnote" weight="medium" tabular>
+                  {Math.round(fraction * 100)}%
+                </Text>
+                <Text size="footnote" dimColor tabular wrap="truncate-end">
+                  {eta ? `${done !== null ? 'about ' : ''}${eta} left${done !== null ? '' : ' in this frame'}` : ''}
+                </Text>
+              </Box>
+            </Box>
+          ) : null}
+          {p.error ? (
+            <Text size="footnote" color="error" wrap="truncate-end">
+              ✗ {p.error}
+            </Text>
+          ) : null}
+          {job.isPaused ? (
+            <Text size="footnote" color="warning" wrap="truncate-end">
+              ❚❚ {job.thermal ?? 'Stopped: press Resume to continue'}
+            </Text>
+          ) : null}
+          {p.last && !p.error && state.word !== 'idle' ? (
+            <Text size="caption" mono dimColor wrap="truncate-end">
+              {p.last}
+            </Text>
+          ) : null}
+          <Box flexDirection="row" columnGap={1} flexWrap="wrap" marginTop={1}>
+            {isConfirming
+              ? [
+                  <Button key={`stop-yes-${job.pid}`} label="Yes, stop it" variant="primary" onPress={() => update($, confirmStop, () => null).then(() => signal($, job.pid, 'TERM'))} />,
+                  <Button key={`stop-no-${job.pid}`} label="Keep running" onPress={() => update($, confirmStop, () => null)} />,
+                ]
+              : [
+                  isRun ? (
+                    <Button key={`pause-${job.pid}`} label={job.isPaused ? 'Resume' : 'Pause'} onPress={() => signal($, job.pid, job.isPaused ? 'CONT' : 'STOP')} />
+                  ) : null,
+                  isRun ? <Button key={`stop-${job.pid}`} label="Stop" onPress={() => update($, confirmStop, () => job.pid)} /> : null,
+                  job.log ? <Button key={`log-${job.pid}`} label="Log" onPress={openPath($, job.log)} /> : null,
+                  p.error ? (
+                    <Button key={`ask-${job.pid}`} label="Ask Claude" variant="primary" onPress={() => askClaude($, job.script ?? 'Blender', p.error ?? '', job.log)} />
+                  ) : null,
+                ]}
+          </Box>
+        </Box>
+      )
+    })
+    const running = snap.jobs.filter(job => stateOf(job).word === 'running').length
     const jobs = (
       <Box flexDirection="column" rowGap={1}>
+        {heading('Jobs', snap.jobs.length === 0 ? undefined : `${running} running · ${snap.jobs.length} in all`)}
         {snap.jobs.length === 0 ? (
-          <Text dimColor>No Blender running.</Text>
+          <Box flexDirection="column">
+            <Text dimColor>No Blender running.</Text>
+            <Text size="footnote" dimColor>
+              A render shows here as soon as it starts.
+            </Text>
+          </Box>
         ) : (
-          snap.jobs.map(job => {
-            const state = stateOf(job)
-            const progress = progressText(job.progress)
-            const who = driverText(job.driver)
-            const p = job.progress
-            return (
-              <Box key={`job-${job.pid}`} flexDirection="column">
-                <Text bold color={state.color} wrap="truncate-end">
-                  {state.color === undefined ? '○' : '●'} {title(job)}
-                </Text>
-                <Text dimColor wrap="truncate-end">
-                  {[state.word, who, since(job.seconds)].filter(Boolean).join(' · ')}
-                </Text>
-                {job.intent ? (
-                  <Text italic dimColor wrap="truncate-end">
-                    “{job.intent}”
-                  </Text>
-                ) : null}
-                {progress ? <Text wrap="truncate-end">{progress}</Text> : null}
-                {p.sample !== undefined && p.samples ? (
-                  <Text color={state.color} wrap="truncate-end">
-                    {bar(p.sample / p.samples, Math.min(30, columns - 6))} {Math.round((100 * p.sample) / p.samples)}%
-                  </Text>
-                ) : null}
-                {p.error ? (
-                  <Text color="error" wrap="truncate-end">
-                    {p.error}
-                  </Text>
-                ) : null}
-                {job.isPaused && job.thermal ? (
-                  <Text color="warning" wrap="truncate-end">
-                    {job.thermal}
-                  </Text>
-                ) : null}
-                {p.last && !p.error && state.word !== 'idle' ? (
-                  <Text dimColor wrap="truncate-end">
-                    {p.last}
-                  </Text>
-                ) : null}
-              </Box>
-            )
-          })
+          jobCards
         )}
       </Box>
     )
 
-    // System
+    // System: the temperature line, then one meter per resource.
     const s = snap.sensors
     const gpuC = s.gpu?.tempC ?? null
-    const gpuColor = gpuC === null ? undefined : gpuC >= options.hotWarnC ? 'error' : gpuC >= options.hotWarnC - 6 ? 'warning' : undefined
-    const ramColor = isLowRam(s) ? 'warning' : undefined
-    const diskColor = s.diskGB !== null && s.diskGB < options.minDiskGB ? 'error' : undefined
+    const tempSeverity: Severity = gpuC === null ? 'ok' : gpuC >= options.hotWarnC ? 'critical' : gpuC >= options.hotWarnC - 6 ? 'warning' : 'ok'
+    const vram = s.gpu && s.gpu.vramUsedMB !== null && s.gpu.vramTotalMB ? s.gpu.vramUsedMB / s.gpu.vramTotalMB : null
+    const ramUsed = s.ramMB !== null && s.ramTotalMB ? 1 - s.ramMB / s.ramTotalMB : null
+    const ramSeverity: Severity =
+      s.ramMB === null || !s.ramTotalMB ? 'ok'
+      : s.ramMB < (s.ramTotalMB * options.lowRamPercent) / 200 ? 'critical'
+      : isLowRam(s) ? 'warning'
+      : 'ok'
+    const diskSeverity: Severity = s.diskGB === null ? 'ok' : s.diskGB < options.minDiskGB ? 'critical' : s.diskGB < options.minDiskGB * 2 ? 'warning' : 'ok'
+    const minutes = Math.max(1, Math.round((snap.gpuHistory.length * options.pollSeconds) / 60))
     const system = (
-      <Box flexDirection="column">
+      <Box flexDirection="column" rowGap={1}>
+        {heading('System')}
         {s.gpu ? (
           <Box flexDirection="column">
-            <Box flexDirection="row" columnGap={1}>
-              {label('GPU')}
-              <Text bold color={gpuColor}>
+            <Box flexDirection="row" columnGap={1} alignItems="center">
+              <Text size="heading" weight="semibold" tabular color={COLOR[tempSeverity]}>
                 {gpuC === null ? '—' : `${gpuC}°C`}
               </Text>
-              <Text dimColor>{s.gpu.label}</Text>
-              <Text color={gpuColor} dimColor={gpuColor === undefined} wrap="truncate-end">
-                {sparkline(snap.gpuHistory.slice(-Math.max(4, columns - 22)), 35, options.hotWarnC + 6)}
+              <Text size="footnote" dimColor wrap="truncate-end">
+                GPU {s.gpu.label}
+                {tempSeverity === 'critical' ? ' · ▲ hot' : tempSeverity === 'warning' ? ' · ▲ warm' : ''}
               </Text>
             </Box>
-            <Box flexDirection="row" columnGap={1}>
-              {label('')}
-              <Text dimColor wrap="truncate-end">
-                {[
-                  s.gpu.busy === null ? null : `load ${s.gpu.busy}%`,
-                  s.gpu.vramUsedMB === null || s.gpu.vramTotalMB === null ? null : `VRAM ${gb(s.gpu.vramUsedMB)}/${gb(s.gpu.vramTotalMB)} GB`,
-                  `warn at ${options.hotWarnC}°C`,
-                ]
-                  .filter(Boolean)
-                  .join(' · ')}
+            {Svg && snap.gpuHistory.length > 1 ? (
+              <Svg
+                key="temp"
+                source={tempSvg(snap.gpuHistory, options.hotWarnC, px, 40, options.pollSeconds)}
+                alt={`GPU temperature over the last ${minutes} min, now ${gpuC ?? '?'}°C`}
+                width={px}
+                height={40}
+                isInteractive
+              />
+            ) : (
+              <Text color={COLOR[tempSeverity]} dimColor={tempSeverity === 'ok'} wrap="truncate-end">
+                {sparkline(snap.gpuHistory.slice(-Math.max(4, columns)), 35, options.hotWarnC + 6)}
               </Text>
-            </Box>
+            )}
+            <Text size="caption" dimColor wrap="truncate-end">
+              last {minutes} min · dashed line: warning at {options.hotWarnC}°C
+            </Text>
           </Box>
         ) : null}
-        <Box flexDirection="row" columnGap={1}>
-          {label('CPU')}
-          <Text bold>{s.cpu?.tempC == null ? '—' : `${s.cpu.tempC}°C`}</Text>
-          <Text dimColor>{snap.cpuBusy === null ? '' : `load ${snap.cpuBusy}%`}</Text>
+        {s.gpu && s.gpu.busy !== null ? (
+          <Box flexDirection="column">
+            {row('GPU load', `${s.gpu.busy}%`, 'ok')}
+            {meter('gpu-load', s.gpu.busy / 100, 'ok')}
+          </Box>
+        ) : null}
+        {s.gpu && vram !== null && s.gpu.vramUsedMB !== null && s.gpu.vramTotalMB ? (
+          <Box flexDirection="column">
+            {row('VRAM', `${gb(s.gpu.vramUsedMB)} / ${gb(s.gpu.vramTotalMB)} GB`, vram >= 0.97 ? 'critical' : vram >= 0.9 ? 'warning' : 'ok')}
+            {meter('vram', vram, vram >= 0.97 ? 'critical' : vram >= 0.9 ? 'warning' : 'ok')}
+          </Box>
+        ) : null}
+        <Box flexDirection="column">
+          {row('CPU', snap.cpuBusy === null ? '—' : `${snap.cpuBusy}%`, 'ok', s.cpu?.tempC == null ? undefined : `${s.cpu.tempC}°C`)}
+          {snap.cpuBusy === null ? null : meter('cpu', snap.cpuBusy / 100, 'ok')}
         </Box>
-        <Box flexDirection="row" columnGap={1}>
-          {label('RAM')}
-          <Text bold color={ramColor}>
-            {s.ramMB === null ? '—' : `${gb(s.ramMB)} GB`}
-          </Text>
-          <Text dimColor wrap="truncate-end">
-            {s.ramTotalMB === null ? 'free' : `free of ${Math.round(s.ramTotalMB / 1024)}`}
-          </Text>
-        </Box>
-        <Box flexDirection="row" columnGap={1}>
-          {label('Disk')}
-          <Text bold color={diskColor}>
-            {s.diskGB === null ? '—' : `${s.diskGB} GB`}
-          </Text>
-          <Text dimColor>free</Text>
-        </Box>
+        {ramUsed !== null && s.ramMB !== null && s.ramTotalMB ? (
+          <Box flexDirection="column">
+            {row('RAM', `${gb(s.ramMB)} GB free`, ramSeverity, `of ${gb(s.ramTotalMB)}${ramSeverity === 'ok' ? '' : ' · low'}`)}
+            {meter('ram', ramUsed, ramSeverity)}
+          </Box>
+        ) : null}
+        {s.diskGB !== null ? (
+          <Box flexDirection="column">
+            {row('Disk', `${s.diskGB} GB free`, diskSeverity, s.diskTotalGB ? `of ${s.diskTotalGB}${diskSeverity === 'ok' ? '' : ' · low'}` : undefined)}
+            {s.diskTotalGB ? meter('disk', 1 - s.diskGB / s.diskTotalGB, diskSeverity) : null}
+          </Box>
+        ) : null}
         {snap.comfy ? (
-          <Text color="warning" wrap="truncate-end">
-            ComfyUI is also running: it shares the GPU and RAM.
+          <Text size="footnote" color="warning" wrap="truncate-end">
+            ▲ ComfyUI is also running: it shares the GPU and RAM.
           </Text>
         ) : null}
       </Box>
@@ -550,17 +761,16 @@ export const register: Register = (on, raw) => {
       const index = stepped === null ? frames.length - 1 : frames.indexOf(basename(stepped))
       const shown: Thumb | null = stepped === null ? await read($, thumb) : await read($, stepThumb)
       const isCurrent = shown !== null && (stepped === null ? shown.key === outputKey(output) || output.kind === 'sequence' : shown.key === stepped)
-      const width = Math.min(480, columns * 8)
 
       let picture
-      if ('Svg' in elements && shown !== null && isCurrent && 'svg' in shown) {
-        const { Svg } = elements
+      if (Svg && shown !== null && isCurrent && 'svg' in shown) {
         picture = (
           <Svg
+            key="preview"
             source={shown.svg}
             alt={output.name}
-            width={width}
-            height={Math.round((width * shown.height) / shown.width)}
+            width={px}
+            height={Math.round((px * shown.height) / shown.width)}
             isInteractive={shown.frames > 1 ? true : undefined}
           />
         )
@@ -577,21 +787,28 @@ export const register: Register = (on, raw) => {
       const name = stepped === null ? output.name : basename(stepped)
       const kindText =
         output.kind === 'sequence'
-          ? `Frames · ${output.stem ?? ''} · ${stepped === null ? `${output.count} so far` : `${index + 1} of ${frames.length}`}`
+          ? `frames · ${output.stem ?? ''} · ${stepped === null ? `${output.count} so far` : `${index + 1} of ${frames.length}`}`
           : output.kind === 'video'
-            ? 'Video'
-            : 'Newest render'
+            ? 'video'
+            : 'newest render'
+      const details = [
+        output.kind === 'video' && shown !== null && 'info' in shown ? shown.info : output.width && output.height ? `${output.width}×${output.height}` : null,
+        `${(output.size / 1048576).toFixed(1)} MB`,
+        ago(snap.at - output.mtimeMs),
+      ].filter(Boolean)
       const go = (to: number) => () => stepTo($, to >= frames.length - 1 ? null : `${output.dir}/${frames[Math.max(0, to)]}`)
 
       previewBox = (
-        <Box flexDirection="column">
-          {heading(kindText)}
+        <Box flexDirection="column" rowGap={1}>
+          {heading('Preview', kindText)}
           {picture}
-          <Box flexDirection="row" columnGap={1}>
-            <Text wrap="truncate-middle">{name}</Text>
-            <Box flexShrink={0}>
-              <Text dimColor>{ago(snap.at - output.mtimeMs)}</Text>
-            </Box>
+          <Box flexDirection="column">
+            <Text size="footnote" weight="medium" wrap="truncate-middle">
+              {name}
+            </Text>
+            <Text size="caption" dimColor tabular wrap="truncate-end">
+              {details.join(' · ')}
+            </Text>
           </Box>
           <Box flexDirection="row" columnGap={1} flexWrap="wrap">
             {output.kind === 'sequence'
@@ -608,17 +825,49 @@ export const register: Register = (on, raw) => {
       )
     }
 
+    // Finished jobs, newest first.
+    const past = (await read($, history)).slice(0, 5)
+    const finishedBox =
+      past.length === 0 ? null : (
+        <Box flexDirection="column" rowGap={0}>
+          {heading('Finished')}
+          {past.map(one => (
+            <Box key={`done-${one.pid}-${one.endedAt}`} flexDirection="column">
+              <Box flexDirection="row" columnGap={1}>
+                <Text color={one.isFailed ? 'error' : 'success'}>{one.isFailed ? '✗' : '✓'}</Text>
+                <Text size="footnote" weight="medium" wrap="truncate-end">
+                  {one.name}
+                </Text>
+                <Box flexShrink={0}>
+                  <Text size="caption" dimColor tabular>
+                    {since(one.seconds)} · {ago(snap.at - one.endedAt)}
+                  </Text>
+                </Box>
+              </Box>
+              {one.isFailed && one.error ? (
+                <Text size="caption" color="error" wrap="truncate-end">
+                  {one.error}
+                </Text>
+              ) : null}
+              {one.log || one.isFailed ? (
+                <Box flexDirection="row" columnGap={1}>
+                  {one.log ? <Button key={`done-log-${one.pid}-${one.endedAt}`} label="Log" plain dimColor onPress={openPath($, one.log)} /> : null}
+                  {one.isFailed ? (
+                    <Button key={`done-ask-${one.pid}-${one.endedAt}`} label="Ask Claude" plain onPress={() => askClaude($, one.name, one.error ?? 'an error', one.log)} />
+                  ) : null}
+                </Box>
+              ) : null}
+            </Box>
+          ))}
+        </Box>
+      )
+
     return (
-      <Box flexDirection="column" rowGap={1}>
-        <Box flexDirection="column">
-          {heading('Jobs')}
-          {jobs}
-        </Box>
-        <Box flexDirection="column">
-          {heading('System')}
-          {system}
-        </Box>
+      <Box flexDirection="column" rowGap={2}>
+        {jobs}
         {previewBox}
+        {system}
+        {finishedBox}
       </Box>
     )
   })

@@ -1,6 +1,6 @@
 {
   "name": "blender-band",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A Blender side panel for Claude Code: running headless jobs with frame and sample progress and who started them, GPU/CPU temperature and load, RAM and disk, and a live preview of the newest render, frame sequence or video. Gives Claude a blender_status tool to check on or wait for a render.",
   "license": "MIT",
   "types": "./types/index.d.ts",
